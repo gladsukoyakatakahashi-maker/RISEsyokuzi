@@ -1,15 +1,9 @@
 {
   "version": 2,
-  "functions": {
-    "src/index.js": {
-      "memory": 512,
-      "maxDuration": 30
-    }
-  },
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "src/index.js"
+      "dest": "/api/webhook"
     }
   ]
 }
