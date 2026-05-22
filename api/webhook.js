@@ -14,6 +14,11 @@ const lineClient = new line.messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
+// 画像取得用に BlobClient を追加
+const lineBlobClient = new line.messagingApi.MessagingApiBlobClient({
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+});
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MEAL_PATTERNS = [
@@ -54,9 +59,10 @@ async function handleEvent(event) {
     replyText = res.content[0].text;
 
   } else if (event.message.type === 'image') {
-    const imageContent = await lineClient.getMessageContent(event.message.id);
+    // BlobClient で画像を取得
+    const imageContent = await lineBlobClient.getMessageContent(event.message.id);
     const chunks = [];
-    for await (const chunk of imageContent) chunks.push(chunk);
+    for await (const chunk of imageContent) chunks.push(Buffer.from(chunk));
     const imageBase64 = Buffer.concat(chunks).toString('base64');
 
     const res = await anthropic.messages.create({
@@ -87,7 +93,6 @@ module.exports = async (req, res) => {
     return res.status(200).json({ status: 'ok' });
   }
 
-  // 署名検証
   const signature = req.headers['x-line-signature'];
   const bodyStr = JSON.stringify(req.body);
 
