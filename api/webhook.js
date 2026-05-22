@@ -1,3 +1,27 @@
+const line = require('@line/bot-sdk');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const systemPrompt = `あなたはパーソナルジム「RISEGYM」の食事管理AIアシスタントです。
+会員の食事内容を分析し、PFC（タンパク質・脂質・炭水化物）とカロリーを推定してフィードバックしてください。
+トーンは親しみやすく励ます口調で、200文字以内で簡潔に返答してください。
+数値は具体的に伝え、否定より代替案を提示してください。`;
+
+const lineClient = new line.messagingApi.MessagingApiClient({
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+});
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const MEAL_PATTERNS = [
+  /食べた|食べました|食べる|飲んだ|飲みました/,
+  /^(朝|昼|夕|夜|間食)\s*[:：]/,
+  /定食|弁当|ランチ|ディナー|朝食|昼食|夕食/,
+];
+
+function isMealReport(text) {
+  return MEAL_PATTERNS.some((re) => re.test(text));
+}
+
 async function handleEvent(event) {
   if (event.type !== 'message') return;
 
