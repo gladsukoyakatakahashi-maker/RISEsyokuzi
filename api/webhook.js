@@ -96,9 +96,9 @@ module.exports = async (req, res) => {
 
   console.log('Webhook received. Events:', JSON.stringify(req.body.events));
 
-  res.status(200).json({ ok: true });
-
   await Promise.all((req.body.events || []).map(handleEvent)).catch((err) => {
     console.error('handleEvent error:', err.message, err.stack);
   });
+
+  res.status(200).json({ ok: true });
 };
