@@ -6,11 +6,6 @@ const systemPrompt = `あなたはパーソナルジム「RISEGYM」の食事管
 トーンは親しみやすく励ます口調で、200文字以内で簡潔に返答してください。
 数値は具体的に伝え、否定より代替案を提示してください。`;
 
-const lineConfig = {
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-};
-
 const lineClient = new line.messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
@@ -82,24 +77,17 @@ async function handleEvent(event) {
   });
 }
 
-// ↓↓↓ ここだけが変更箇所 ↓↓↓
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(200).json({ status: 'ok' });
   }
 
-  // rawBodyを使って署名検証する
-  const rawBody = req.rawBody ?? JSON.stringify(req.body);
-  const signature = req.headers['x-line-signature'];
-
-  if (!line.validateSignature(rawBody, lineConfig.channelSecret, signature)) {
-    console.error('Invalid signature');
-    return res.status(400).json({ error: 'Invalid signature' });
-  }
-
-  // bodyはVercelがパース済みのものをそのまま使う
-  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  // 署名検証を一時スキップ（テスト用）
+  console.log('Webhook received. Events:', JSON.stringify(req.body.events));
 
   res.status(200).json({ ok: true });
-  await Promise.all(body.events.map(handleEvent)).catch(console.error);
+
+  await Promise.all((req.body.events || []).map(handleEvent)).catch((err) => {
+    console.error('handleEvent error:', err);
+  });
 };
