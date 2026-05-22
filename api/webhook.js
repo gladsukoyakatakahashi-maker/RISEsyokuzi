@@ -1,7 +1,5 @@
 const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
-const fs = require('fs');
-const path = require('path');
 
 const systemPrompt = `あなたはパーソナルジム「RISEGYM」の食事管理AIアシスタントです。
 会員の食事内容を分析し、PFC（タンパク質・脂質・炭水化物）とカロリーを推定してフィードバックしてください。
@@ -84,16 +82,24 @@ async function handleEvent(event) {
   });
 }
 
+// ↓↓↓ ここだけが変更箇所 ↓↓↓
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(200).json({ status: 'ok' });
   }
 
+  // rawBodyを使って署名検証する
+  const rawBody = req.rawBody ?? JSON.stringify(req.body);
   const signature = req.headers['x-line-signature'];
-  if (!line.validateSignature(JSON.stringify(req.body), lineConfig.channelSecret, signature)) {
+
+  if (!line.validateSignature(rawBody, lineConfig.channelSecret, signature)) {
+    console.error('Invalid signature');
     return res.status(400).json({ error: 'Invalid signature' });
   }
 
+  // bodyはVercelがパース済みのものをそのまま使う
+  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+
   res.status(200).json({ ok: true });
-  await Promise.all(req.body.events.map(handleEvent)).catch(console.error);
+  await Promise.all(body.events.map(handleEvent)).catch(console.error);
 };
