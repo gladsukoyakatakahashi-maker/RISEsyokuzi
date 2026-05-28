@@ -1,5 +1,11 @@
 const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
+const { Redis } = require('@upstash/redis');
+
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+});
 
 const systemPrompt = `あなたはパーソナルジム「RISEGYM」の食事管理AIアシスタントです。
 会員の食事内容を分析し、PFC（タンパク質・脂質・炭水化物）とカロリーを推定してフィードバックしてください。
@@ -14,7 +20,6 @@ const lineClient = new line.messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// 画像取得用に BlobClient を追加
 const lineBlobClient = new line.messagingApi.MessagingApiBlobClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
@@ -31,35 +36,177 @@ function isMealReport(text) {
   return MEAL_PATTERNS.some((re) => re.test(text));
 }
 
+// 今日の日付キー（例：2026-05-22）
+function todayKey(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  return `meal:${userId}:${today}`;
+}
+
+// 会員プロフィールの取得
+async function getProfile(userId) {
+  const profile = await redis.get(`profile:${userId}`);
+  return profile;
+}
+
+// 会員プロフィールの保存
+async function saveProfile(userId, data) {
+  await redis.set(`profile:${userId}`, JSON.stringify(data));
+}
+
+// 今日の食事累計を取得
+async function getTodayTotal(userId) {
+  const data = await redis.get(todayKey(userId));
+  return data ? JSON.parse(data) : { calories: 0, protein: 0, fat: 0, carbs: 0 };
+}
+
+// 今日の食事累計を更新
+async function updateTodayTotal(userId, meal) {
+  const current = await getTodayTotal(userId);
+  const updated = {
+    calories: current.calories + (meal.calories || 0),
+    protein: current.protein + (meal.protein || 0),
+    fat: current.fat + (meal.fat || 0),
+    carbs: current.carbs + (meal.carbs || 0),
+  };
+  // 当日23:59まで有効
+  await redis.set(todayKey(userId), JSON.stringify(updated), { ex: 86400 });
+  return updated;
+}
+
+// Claude APIでPFCを数値として抽出
+async function analyzeMeal(text, goal) {
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 600,
+    system: systemPrompt,
+    messages: [{
+      role: 'user',
+      content: `食事内容: ${text}\n\n以下のJSON形式のみで返答してください（他のテキスト不要）:\n{"calories":数値,"protein":数値,"fat":数値,"carbs":数値,"advice":"アドバイス文"}`
+    }],
+  });
+  try {
+    return JSON.parse(res.content[0].text);
+  } catch {
+    return null;
+  }
+}
+
 async function handleEvent(event) {
+  const userId = event.source.userId;
+
+  // 友だち追加イベント
+  if (event.type === 'follow') {
+    await saveProfile(userId, { step: 'ask_goal' });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{
+        type: 'text',
+        text: 'はじめまして！RISEGYM食事管理ボットです🏋️\n\nまずあなたの目標を教えてください。\n\n1️⃣ 減量\n2️⃣ 増量\n3️⃣ ボディメイク'
+      }]
+    });
+    return;
+  }
+
   if (event.type !== 'message') return;
 
-  const user = {
-    name: 'テストユーザー',
-    goal: '減量',
-    calorieTarget: 1800,
-    proteinTarget: 120,
-  };
+  // プロフィール確認（初回ヒアリング中か）
+  const profile = await getProfile(userId);
+  const profileData = profile ? (typeof profile === 'string' ? JSON.parse(profile) : profile) : null;
 
+  // 初回ヒアリング：目標選択
+  if (!profileData || profileData.step === 'ask_goal') {
+    const text = event.message.text || '';
+    let goal = null;
+    if (text.includes('1') || text.includes('減量')) goal = '減量';
+    else if (text.includes('2') || text.includes('増量')) goal = '増量';
+    else if (text.includes('3') || text.includes('ボディメイク')) goal = 'ボディメイク';
+
+    if (!goal) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '1・2・3の番号か、「減量」「増量」「ボディメイク」でお答えください😊' }]
+      });
+      return;
+    }
+
+    await saveProfile(userId, { step: 'ask_weight', goal });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: `「${goal}」ですね！💪\n\n次に現在の体重を教えてください。\n（例：68）` }]
+    });
+    return;
+  }
+
+  // 初回ヒアリング：体重入力
+  if (profileData.step === 'ask_weight') {
+    const weight = parseFloat(event.message.text);
+    if (isNaN(weight) || weight < 30 || weight > 200) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '体重を数字で入力してください。\n（例：68）' }]
+      });
+      return;
+    }
+
+    // 目標に応じたカロリー・タンパク質目標を自動設定
+    const calorieMap = { '減量': 1800, '増量': 2800, 'ボディメイク': 2200 };
+    const proteinMap = { '減量': 120, '増量': 160, 'ボディメイク': 140 };
+
+    const completed = {
+      step: 'done',
+      goal: profileData.goal,
+      weight,
+      calorieTarget: calorieMap[profileData.goal],
+      proteinTarget: proteinMap[profileData.goal],
+    };
+    await saveProfile(userId, completed);
+
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{
+        type: 'text',
+        text: `登録完了です🎉\n\n【あなたの目標】\n・目標：${completed.goal}\n・体重：${weight}kg\n・カロリー目標：${completed.calorieTarget}kcal/日\n・タンパク質目標：${completed.proteinTarget}g/日\n\n食事内容をテキストや写真で送ってください！`
+      }]
+    });
+    return;
+  }
+
+  // 通常の食事解析
+  const user = profileData;
   let replyText = '';
 
   if (event.message.type === 'text') {
     const text = event.message.text;
 
-    const userPrompt = isMealReport(text)
-      ? `会員情報: 目標=${user.goal}, カロリー目標=${user.calorieTarget}kcal, タンパク質目標=${user.proteinTarget}g\n\n食事内容: ${text}\n\nPFCとカロリーを推定してアドバイスをください。フォーマット:\n【解析結果】\n・カロリー：約〇〇kcal\n・P:〇g / F:〇g / C:〇g\n【アドバイス】（1〜2文）`
-      : `会員の質問: ${text}\n栄養に関する質問に200文字以内で答えてください。`;
+    if (isMealReport(text)) {
+      const meal = await analyzeMeal(text, user.goal);
 
-    const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 600,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userPrompt }],
-    });
-    replyText = res.content[0].text;
+      if (meal) {
+        const todayTotal = await updateTodayTotal(userId, meal);
+        const remainCalories = user.calorieTarget - todayTotal.calories;
+        const remainProtein = user.proteinTarget - todayTotal.protein;
+
+        replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
+      } else {
+        const res = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 600,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: `食事内容: ${text}\nPFCとカロリーを推定してアドバイスをください。` }],
+        });
+        replyText = res.content[0].text;
+      }
+    } else {
+      const res = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 600,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: `会員の質問: ${text}\n栄養に関する質問に200文字以内で答えてください。` }],
+      });
+      replyText = res.content[0].text;
+    }
 
   } else if (event.message.type === 'image') {
-    // BlobClient で画像を取得
     const imageContent = await lineBlobClient.getMessageContent(event.message.id);
     const chunks = [];
     for await (const chunk of imageContent) chunks.push(Buffer.from(chunk));
