@@ -42,6 +42,20 @@ function todayKey(userId) {
   return `meal:${userId}:${today}`;
 }
 
+function getLastWeekDates() {
+  const dates = [];
+  const today = new Date();
+  const dayOfWeek = today.getDay();
+  const lastMonday = new Date(today);
+  lastMonday.setDate(today.getDate() - dayOfWeek - 6);
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(lastMonday);
+    d.setDate(lastMonday.getDate() + i);
+    dates.push(d.toISOString().slice(0, 10));
+  }
+  return dates;
+}
+
 async function getProfile(userId) {
   const profile = await redis.get(`profile:${userId}`);
   return profile;
@@ -78,7 +92,6 @@ async function analyzeMeal(text, goal) {
       content: `食事内容: ${text}\n\n以下のJSON形式のみで返答してください（マークダウン不要、他のテキスト不要）:\n{"calories":数値,"protein":数値,"fat":数値,"carbs":数値,"advice":"アドバイス文（100文字以内）"}`
     }],
   });
-
   try {
     const raw = res.content[0].text.replace(/```json|```/g, '').trim();
     return JSON.parse(raw);
@@ -87,8 +100,90 @@ async function analyzeMeal(text, goal) {
   }
 }
 
+async function getWeeklySummary(userId) {
+  const dates = getLastWeekDates();
+  let totalCalories = 0, totalProtein = 0, totalFat = 0, totalCarbs = 0, recordedDays = 0;
+  for (const date of dates) {
+    const data = await redis.get(`meal:${userId}:${date}`);
+    if (data) {
+      const meal = typeof data === 'string' ? JSON.parse(data) : data;
+      totalCalories += meal.calories || 0;
+      totalProtein += meal.protein || 0;
+      totalFat += meal.fat || 0;
+      totalCarbs += meal.carbs || 0;
+      recordedDays++;
+    }
+  }
+  return { totalCalories, totalProtein, totalFat, totalCarbs, recordedDays };
+}
+
+async function generateWeeklyAdvice(summary, profile) {
+  const avgCalories = summary.recordedDays > 0 ? Math.round(summary.totalCalories / summary.recordedDays) : 0;
+  const avgProtein = summary.recordedDays > 0 ? Math.round(summary.totalProtein / summary.recordedDays) : 0;
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 200,
+    messages: [{
+      role: 'user',
+      content: `会員情報: 目標=${profile.goal}, カロリー目標=${profile.calorieTarget}kcal, タンパク質目標=${profile.proteinTarget}g\n先週の平均: カロリー=${avgCalories}kcal, タンパク質=${avgProtein}g, 記録日数=${summary.recordedDays}/7日\n\n今週の重点ポイントを1文（50文字以内）と、ひとこと応援メッセージ（20文字以内）をJSON形式で返してください:\n{"point":"重点ポイント","cheer":"応援メッセージ"}`
+    }],
+  });
+  try {
+    const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+    return JSON.parse(raw);
+  } catch {
+    return { point: '食事記録を継続しましょう！', cheer: 'この調子で💪' };
+  }
+}
+
+async function sendWeeklySummaryToAll() {
+  const keys = await redis.keys('profile:*');
+  const userIds = keys.map((k) => k.replace('profile:', ''));
+  const dates = getLastWeekDates();
+  const startDate = dates[0].slice(5).replace('-', '/');
+  const endDate = dates[6].slice(5).replace('-', '/');
+  let successCount = 0;
+
+  for (const uid of userIds) {
+    try {
+      const profileRaw = await redis.get(`profile:${uid}`);
+      if (!profileRaw) continue;
+      const profile = typeof profileRaw === 'string' ? JSON.parse(profileRaw) : profileRaw;
+      if (profile.step !== 'done') continue;
+
+      const summary = await getWeeklySummary(uid);
+      if (summary.recordedDays === 0) continue;
+
+      const avgCalories = Math.round(summary.totalCalories / summary.recordedDays);
+      const avgProtein = Math.round(summary.totalProtein / summary.recordedDays);
+      const calorieDiff = avgCalories - profile.calorieTarget;
+      const proteinStatus = avgProtein >= profile.proteinTarget ? '達成✅' : '未達⚠️';
+      const advice = await generateWeeklyAdvice(summary, profile);
+
+      const message = `先週の食事サマリー（${startDate}〜${endDate}）\n\n【数値結果】\n・平均カロリー：${avgCalories}kcal（目標比：${calorieDiff >= 0 ? '+' : ''}${calorieDiff}kcal）\n・タンパク質：${avgProtein}g → ${proteinStatus}\n・記録日数：${summary.recordedDays}/7日\n\n【今週の重点ポイント】\n${advice.point}\n\n【ひとこと応援】\n${advice.cheer}`;
+
+      await fetch('https://api.line.me/v2/bot/message/push', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+        },
+        body: JSON.stringify({
+          to: uid,
+          messages: [{ type: 'text', text: message }],
+        }),
+      });
+      successCount++;
+    } catch (err) {
+      console.error(`Error for ${uid}:`, err.message);
+    }
+  }
+  return successCount;
+}
+
 async function handleEvent(event) {
   const userId = event.source.userId;
+  console.log('userId:', userId);userId":"Uc7ef960aa18bc0f9345d87c3a42ff554
 
   if (event.type === 'follow') {
     await saveProfile(userId, { step: 'ask_goal' });
@@ -103,6 +198,34 @@ async function handleEvent(event) {
   }
 
   if (event.type !== 'message') return;
+
+  // トレーナーコマンド：サマリー送信
+  if (event.message.type === 'text' && event.message.text === 'サマリー送信') {
+    if (userId !== process.env.TRAINER_LINE_ID) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: 'この操作は許可されていません。' }]
+      });
+      return;
+    }
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: '週次サマリーを送信中です...⏳' }]
+    });
+    const count = await sendWeeklySummaryToAll();
+    await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({
+        to: userId,
+        messages: [{ type: 'text', text: `✅ 送信完了！${count}名に週次サマリーを送りました。` }],
+      }),
+    });
+    return;
+  }
 
   const profile = await getProfile(userId);
   const profileData = profile ? (typeof profile === 'string' ? JSON.parse(profile) : profile) : null;
@@ -121,7 +244,6 @@ async function handleEvent(event) {
       });
       return;
     }
-
     await saveProfile(userId, { step: 'ask_weight', goal });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
@@ -139,10 +261,8 @@ async function handleEvent(event) {
       });
       return;
     }
-
     const calorieMap = { '減量': 1800, '増量': 2800, 'ボディメイク': 2200 };
     const proteinMap = { '減量': 120, '増量': 160, 'ボディメイク': 140 };
-
     const completed = {
       step: 'done',
       goal: profileData.goal,
@@ -151,7 +271,6 @@ async function handleEvent(event) {
       proteinTarget: proteinMap[profileData.goal],
     };
     await saveProfile(userId, completed);
-
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
@@ -170,12 +289,10 @@ async function handleEvent(event) {
 
     if (isMealReport(text)) {
       const meal = await analyzeMeal(text, user.goal);
-
       if (meal) {
         const todayTotal = await updateTodayTotal(userId, meal);
         const remainCalories = user.calorieTarget - todayTotal.calories;
         const remainProtein = user.proteinTarget - todayTotal.protein;
-
         replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
       } else {
         const res = await anthropic.messages.create({
@@ -201,7 +318,6 @@ async function handleEvent(event) {
     const chunks = [];
     for await (const chunk of imageContent) chunks.push(Buffer.from(chunk));
     const imageBase64 = Buffer.concat(chunks).toString('base64');
-
     const res = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 600,
