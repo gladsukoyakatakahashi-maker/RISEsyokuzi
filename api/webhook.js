@@ -30,6 +30,7 @@ const MEAL_PATTERNS = [
   /食べた|食べました|食べる|飲んだ|飲みました/,
   /^(朝|昼|夕|夜|間食)\s*[:：]/,
   /定食|弁当|ランチ|ディナー|朝食|昼食|夕食/,
+  /ご飯|ごはん|パン|麺|うどん|そば|ラーメン|パスタ|丼|寿司|焼き肉|カレー|サラダ|スープ|卵|肉|魚|野菜/,
 ];
 
 function isMealReport(text) {
@@ -89,7 +90,6 @@ async function analyzeMeal(text, goal) {
 async function handleEvent(event) {
   const userId = event.source.userId;
 
-  // 友だち追加イベント
   if (event.type === 'follow') {
     await saveProfile(userId, { step: 'ask_goal' });
     await lineClient.replyMessage({
@@ -107,7 +107,6 @@ async function handleEvent(event) {
   const profile = await getProfile(userId);
   const profileData = profile ? (typeof profile === 'string' ? JSON.parse(profile) : profile) : null;
 
-  // 初回ヒアリング：目標選択
   if (!profileData || profileData.step === 'ask_goal') {
     const text = event.message.text || '';
     let goal = null;
@@ -131,7 +130,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：体重入力
   if (profileData.step === 'ask_weight') {
     const weight = parseFloat(event.message.text);
     if (isNaN(weight) || weight < 30 || weight > 200) {
@@ -164,7 +162,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 通常の食事解析
   const user = profileData;
   let replyText = '';
 
