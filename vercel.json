@@ -4,6 +4,15 @@
   "functions": {
     "api/webhook.js": {
       "maxDuration": 30
+    },
+    "api/cron/weekly.js": {
+      "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/weekly",
+      "schedule": "0 23 * * 0"
+    }
+  ]
 }
