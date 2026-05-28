@@ -36,30 +36,25 @@ function isMealReport(text) {
   return MEAL_PATTERNS.some((re) => re.test(text));
 }
 
-// 今日の日付キー（例：2026-05-22）
 function todayKey(userId) {
   const today = new Date().toISOString().slice(0, 10);
   return `meal:${userId}:${today}`;
 }
 
-// 会員プロフィールの取得
 async function getProfile(userId) {
   const profile = await redis.get(`profile:${userId}`);
   return profile;
 }
 
-// 会員プロフィールの保存
 async function saveProfile(userId, data) {
   await redis.set(`profile:${userId}`, JSON.stringify(data));
 }
 
-// 今日の食事累計を取得
 async function getTodayTotal(userId) {
   const data = await redis.get(todayKey(userId));
-  return data ? JSON.parse(data) : { calories: 0, protein: 0, fat: 0, carbs: 0 };
+  return data ? (typeof data === 'string' ? JSON.parse(data) : data) : { calories: 0, protein: 0, fat: 0, carbs: 0 };
 }
 
-// 今日の食事累計を更新
 async function updateTodayTotal(userId, meal) {
   const current = await getTodayTotal(userId);
   const updated = {
@@ -68,24 +63,24 @@ async function updateTodayTotal(userId, meal) {
     fat: current.fat + (meal.fat || 0),
     carbs: current.carbs + (meal.carbs || 0),
   };
-  // 当日23:59まで有効
   await redis.set(todayKey(userId), JSON.stringify(updated), { ex: 86400 });
   return updated;
 }
 
-// Claude APIでPFCを数値として抽出
 async function analyzeMeal(text, goal) {
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
     max_tokens: 600,
-    system: systemPrompt,
+    system: `あなたは食事のPFCを推定するアシスタントです。必ずJSON形式のみで返答してください。説明文は不要です。`,
     messages: [{
       role: 'user',
-      content: `食事内容: ${text}\n\n以下のJSON形式のみで返答してください（他のテキスト不要）:\n{"calories":数値,"protein":数値,"fat":数値,"carbs":数値,"advice":"アドバイス文"}`
+      content: `食事内容: ${text}\n\n以下のJSON形式のみで返答してください（マークダウン不要、他のテキスト不要）:\n{"calories":数値,"protein":数値,"fat":数値,"carbs":数値,"advice":"アドバイス文（100文字以内）"}`
     }],
   });
+
   try {
-    return JSON.parse(res.content[0].text);
+    const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+    return JSON.parse(raw);
   } catch {
     return null;
   }
@@ -109,7 +104,6 @@ async function handleEvent(event) {
 
   if (event.type !== 'message') return;
 
-  // プロフィール確認（初回ヒアリング中か）
   const profile = await getProfile(userId);
   const profileData = profile ? (typeof profile === 'string' ? JSON.parse(profile) : profile) : null;
 
@@ -148,7 +142,6 @@ async function handleEvent(event) {
       return;
     }
 
-    // 目標に応じたカロリー・タンパク質目標を自動設定
     const calorieMap = { '減量': 1800, '増量': 2800, 'ボディメイク': 2200 };
     const proteinMap = { '減量': 120, '増量': 160, 'ボディメイク': 140 };
 
