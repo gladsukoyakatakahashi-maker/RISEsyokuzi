@@ -183,7 +183,6 @@ async function sendWeeklySummaryToAll() {
 
 async function handleEvent(event) {
   const userId = event.source.userId;
-  console.log('userId:', userId);userId":"Uc7ef960aa18bc0f9345d87c3a42ff554
 
   if (event.type === 'follow') {
     await saveProfile(userId, { step: 'ask_goal' });
@@ -199,7 +198,6 @@ async function handleEvent(event) {
 
   if (event.type !== 'message') return;
 
-  // トレーナーコマンド：サマリー送信
   if (event.message.type === 'text' && event.message.text === 'サマリー送信') {
     if (userId !== process.env.TRAINER_LINE_ID) {
       await lineClient.replyMessage({
