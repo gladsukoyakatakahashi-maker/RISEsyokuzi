@@ -316,19 +316,30 @@ async function handleEvent(event) {
     const chunks = [];
     for await (const chunk of imageContent) chunks.push(Buffer.from(chunk));
     const imageBase64 = Buffer.concat(chunks).toString('base64');
+
     const res = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 600,
-      system: systemPrompt,
+      system: `あなたは食事のPFCを推定するアシスタントです。必ずJSON形式のみで返答してください。説明文は不要です。`,
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
-          { type: 'text', text: `目標: ${user.goal}。この食事のPFCとカロリーを推定してアドバイスをください。\n【料理名】\n【解析結果】\n・カロリー：約〇〇kcal\n・P:〇g / F:〇g / C:〇g\n【アドバイス】（1〜2文）` },
+          { type: 'text', text: `目標: ${user.goal}。この食事のPFCとカロリーを推定してください。\n以下のJSON形式のみで返答してください（マークダウン不要）:\n{"dish":"料理名","calories":数値,"protein":数値,"fat":数値,"carbs":数値,"advice":"アドバイス文（100文字以内）"}` },
         ],
       }],
     });
-    replyText = res.content[0].text;
+
+    try {
+      const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+      const meal = JSON.parse(raw);
+      const todayTotal = await updateTodayTotal(userId, meal);
+      const remainCalories = user.calorieTarget - todayTotal.calories;
+      const remainProtein = user.proteinTarget - todayTotal.protein;
+      replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
+    } catch {
+      replyText = '画像を解析できませんでした。別の角度から撮り直してみてください。';
+    }
   }
 
   if (!replyText) return;
