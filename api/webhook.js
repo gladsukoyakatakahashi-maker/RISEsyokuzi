@@ -1,11 +1,7 @@
 const line = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
-const { Redis } = require('@upstash/redis');
 
-const redis = new Redis({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN,
-});
+const GAS_URL = process.env.GAS_URL;
 
 const systemPrompt = `あなたはパーソナルジム「RISEGYM」の食事管理AIアシスタントです。
 会員の食事内容を分析し、PFC（タンパク質・脂質・炭水化物）とカロリーを推定してフィードバックしてください。
@@ -37,9 +33,8 @@ function isMealReport(text) {
   return MEAL_PATTERNS.some((re) => re.test(text));
 }
 
-function todayKey(userId) {
-  const today = new Date().toISOString().slice(0, 10);
-  return `meal:${userId}:${today}`;
+function getToday() {
+  return new Date().toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' });
 }
 
 function getLastWeekDates() {
@@ -51,35 +46,20 @@ function getLastWeekDates() {
   for (let i = 0; i < 7; i++) {
     const d = new Date(lastMonday);
     d.setDate(lastMonday.getDate() + i);
-    dates.push(d.toISOString().slice(0, 10));
+    dates.push(d.toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }));
   }
   return dates;
 }
 
-async function getProfile(userId) {
-  const profile = await redis.get(`profile:${userId}`);
-  return profile;
-}
-
-async function saveProfile(userId, data) {
-  await redis.set(`profile:${userId}`, JSON.stringify(data));
-}
-
-async function getTodayTotal(userId) {
-  const data = await redis.get(todayKey(userId));
-  return data ? (typeof data === 'string' ? JSON.parse(data) : data) : { calories: 0, protein: 0, fat: 0, carbs: 0 };
-}
-
-async function updateTodayTotal(userId, meal) {
-  const current = await getTodayTotal(userId);
-  const updated = {
-    calories: current.calories + (meal.calories || 0),
-    protein: current.protein + (meal.protein || 0),
-    fat: current.fat + (meal.fat || 0),
-    carbs: current.carbs + (meal.carbs || 0),
-  };
-  await redis.set(todayKey(userId), JSON.stringify(updated), { ex: 86400 });
-  return updated;
+// GAS APIを呼び出す共通関数
+async function callGAS(action, params = {}) {
+  const res = await fetch(GAS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...params }),
+    redirect: 'follow',
+  });
+  return res.json();
 }
 
 async function analyzeMeal(text, goal) {
@@ -98,23 +78,6 @@ async function analyzeMeal(text, goal) {
   } catch {
     return null;
   }
-}
-
-async function getWeeklySummary(userId) {
-  const dates = getLastWeekDates();
-  let totalCalories = 0, totalProtein = 0, totalFat = 0, totalCarbs = 0, recordedDays = 0;
-  for (const date of dates) {
-    const data = await redis.get(`meal:${userId}:${date}`);
-    if (data) {
-      const meal = typeof data === 'string' ? JSON.parse(data) : data;
-      totalCalories += meal.calories || 0;
-      totalProtein += meal.protein || 0;
-      totalFat += meal.fat || 0;
-      totalCarbs += meal.carbs || 0;
-      recordedDays++;
-    }
-  }
-  return { totalCalories, totalProtein, totalFat, totalCarbs, recordedDays };
 }
 
 async function generateWeeklyAdvice(summary, profile) {
@@ -137,28 +100,22 @@ async function generateWeeklyAdvice(summary, profile) {
 }
 
 async function sendWeeklySummaryToAll() {
-  const keys = await redis.keys('profile:*');
-  const userIds = keys.map((k) => k.replace('profile:', ''));
+  const users = await callGAS('getAllUsers');
   const dates = getLastWeekDates();
-  const startDate = dates[0].slice(5).replace('-', '/');
-  const endDate = dates[6].slice(5).replace('-', '/');
+  const startDate = dates[0];
+  const endDate = dates[6];
   let successCount = 0;
 
-  for (const uid of userIds) {
+  for (const user of users) {
     try {
-      const profileRaw = await redis.get(`profile:${uid}`);
-      if (!profileRaw) continue;
-      const profile = typeof profileRaw === 'string' ? JSON.parse(profileRaw) : profileRaw;
-      if (profile.step !== 'done') continue;
-
-      const summary = await getWeeklySummary(uid);
+      const summary = await callGAS('getWeeklySummary', { userId: user.userId, dates });
       if (summary.recordedDays === 0) continue;
 
       const avgCalories = Math.round(summary.totalCalories / summary.recordedDays);
       const avgProtein = Math.round(summary.totalProtein / summary.recordedDays);
-      const calorieDiff = avgCalories - profile.calorieTarget;
-      const proteinStatus = avgProtein >= profile.proteinTarget ? '達成✅' : '未達⚠️';
-      const advice = await generateWeeklyAdvice(summary, profile);
+      const calorieDiff = avgCalories - user.calorieTarget;
+      const proteinStatus = avgProtein >= user.proteinTarget ? '達成✅' : '未達⚠️';
+      const advice = await generateWeeklyAdvice(summary, user);
 
       const message = `先週の食事サマリー（${startDate}〜${endDate}）\n\n【数値結果】\n・平均カロリー：${avgCalories}kcal（目標比：${calorieDiff >= 0 ? '+' : ''}${calorieDiff}kcal）\n・タンパク質：${avgProtein}g → ${proteinStatus}\n・記録日数：${summary.recordedDays}/7日\n\n【今週の重点ポイント】\n${advice.point}\n\n【ひとこと応援】\n${advice.cheer}`;
 
@@ -169,13 +126,13 @@ async function sendWeeklySummaryToAll() {
           'Authorization': `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
         },
         body: JSON.stringify({
-          to: uid,
+          to: user.userId,
           messages: [{ type: 'text', text: message }],
         }),
       });
       successCount++;
     } catch (err) {
-      console.error(`Error for ${uid}:`, err.message);
+      console.error(`Error for ${user.userId}:`, err.message);
     }
   }
   return successCount;
@@ -185,7 +142,7 @@ async function handleEvent(event) {
   const userId = event.source.userId;
 
   if (event.type === 'follow') {
-    await saveProfile(userId, { step: 'ask_goal' });
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_goal' } });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
@@ -225,8 +182,7 @@ async function handleEvent(event) {
     return;
   }
 
-  const profile = await getProfile(userId);
-  const profileData = profile ? (typeof profile === 'string' ? JSON.parse(profile) : profile) : null;
+  const profileData = await callGAS('getProfile', { userId });
 
   if (!profileData || profileData.step === 'ask_goal') {
     const text = event.message.text || '';
@@ -242,7 +198,7 @@ async function handleEvent(event) {
       });
       return;
     }
-    await saveProfile(userId, { step: 'ask_weight', goal });
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_weight', goal } });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{ type: 'text', text: `「${goal}」ですね！💪\n\n次に現在の体重を教えてください。\n（例：68）` }]
@@ -268,7 +224,7 @@ async function handleEvent(event) {
       calorieTarget: calorieMap[profileData.goal],
       proteinTarget: proteinMap[profileData.goal],
     };
-    await saveProfile(userId, completed);
+    await callGAS('saveProfile', { userId, profile: completed });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
@@ -288,7 +244,8 @@ async function handleEvent(event) {
     if (isMealReport(text)) {
       const meal = await analyzeMeal(text, user.goal);
       if (meal) {
-        const todayTotal = await updateTodayTotal(userId, meal);
+        const today = getToday();
+        const todayTotal = await callGAS('updateTodayTotal', { userId, date: today, meal });
         const remainCalories = user.calorieTarget - todayTotal.calories;
         const remainProtein = user.proteinTarget - todayTotal.protein;
         replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
@@ -333,7 +290,8 @@ async function handleEvent(event) {
     try {
       const raw = res.content[0].text.replace(/```json|```/g, '').trim();
       const meal = JSON.parse(raw);
-      const todayTotal = await updateTodayTotal(userId, meal);
+      const today = getToday();
+      const todayTotal = await callGAS('updateTodayTotal', { userId, date: today, meal });
       const remainCalories = user.calorieTarget - todayTotal.calories;
       const remainProtein = user.proteinTarget - todayTotal.protein;
       replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
