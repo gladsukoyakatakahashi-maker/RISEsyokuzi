@@ -51,15 +51,24 @@ function getLastWeekDates() {
   return dates;
 }
 
-// GAS APIを呼び出す共通関数
 async function callGAS(action, params = {}) {
-  const res = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action, ...params }),
-    redirect: 'follow',
-  });
-  return res.json();
+  console.log('callGAS start:', action, JSON.stringify(params));
+  console.log('GAS_URL:', process.env.GAS_URL ? 'set' : 'NOT SET');
+
+  try {
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, ...params }),
+      redirect: 'follow',
+    });
+    const text = await res.text();
+    console.log('GAS response:', text);
+    return JSON.parse(text);
+  } catch (err) {
+    console.error('callGAS error:', err.message);
+    return null;
+  }
 }
 
 async function analyzeMeal(text, goal) {
@@ -183,6 +192,7 @@ async function handleEvent(event) {
   }
 
   const profileData = await callGAS('getProfile', { userId });
+  console.log('profileData:', JSON.stringify(profileData));
 
   if (!profileData || profileData.step === 'ask_goal') {
     const text = event.message.text || '';
