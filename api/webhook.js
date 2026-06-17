@@ -33,28 +33,35 @@ function isMealReport(text) {
   return MEAL_PATTERNS.some((re) => re.test(text));
 }
 
+// スプレッドシートの日付形式に合わせる（2026/6/17形式）
 function getToday() {
-  return new Date().toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const now = new Date();
+  const jst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+  const y = jst.getFullYear();
+  const m = jst.getMonth() + 1;
+  const d = jst.getDate();
+  return `${y}/${m}/${d}`;
 }
 
 function getLastWeekDates() {
   const dates = [];
-  const today = new Date();
-  const dayOfWeek = today.getDay();
-  const lastMonday = new Date(today);
-  lastMonday.setDate(today.getDate() - dayOfWeek - 6);
+  const now = new Date();
+  const jst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+  const dayOfWeek = jst.getDay();
+  const lastMonday = new Date(jst);
+  lastMonday.setDate(jst.getDate() - dayOfWeek - 6);
   for (let i = 0; i < 7; i++) {
     const d = new Date(lastMonday);
     d.setDate(lastMonday.getDate() + i);
-    dates.push(d.toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }));
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    dates.push(`${y}/${m}/${day}`);
   }
   return dates;
 }
 
 async function callGAS(action, params = {}) {
-  console.log('callGAS start:', action, JSON.stringify(params));
-  console.log('GAS_URL:', process.env.GAS_URL ? 'set' : 'NOT SET');
-
   try {
     const res = await fetch(GAS_URL, {
       method: 'POST',
@@ -63,7 +70,6 @@ async function callGAS(action, params = {}) {
       redirect: 'follow',
     });
     const text = await res.text();
-    console.log('GAS response:', text);
     return JSON.parse(text);
   } catch (err) {
     console.error('callGAS error:', err.message);
@@ -192,7 +198,6 @@ async function handleEvent(event) {
   }
 
   const profileData = await callGAS('getProfile', { userId });
-  console.log('profileData:', JSON.stringify(profileData));
 
   if (!profileData || profileData.step === 'ask_goal') {
     const text = event.message.text || '';
@@ -227,25 +232,32 @@ async function handleEvent(event) {
     }
     const calorieMap = { '減量': 1800, '増量': 2800, 'ボディメイク': 2200 };
     const proteinMap = { '減量': 120, '増量': 160, 'ボディメイク': 140 };
+    const fatMap = { '減量': 50, '増量': 80, 'ボディメイク': 65 };
+    const carbsMap = { '減量': 180, '増量': 320, 'ボディメイク': 250 };
     const completed = {
       step: 'done',
       goal: profileData.goal,
       weight,
       calorieTarget: calorieMap[profileData.goal],
       proteinTarget: proteinMap[profileData.goal],
+      fatTarget: fatMap[profileData.goal],
+      carbsTarget: carbsMap[profileData.goal],
     };
     await callGAS('saveProfile', { userId, profile: completed });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
         type: 'text',
-        text: `登録完了です🎉\n\n【あなたの目標】\n・目標：${completed.goal}\n・体重：${weight}kg\n・カロリー目標：${completed.calorieTarget}kcal/日\n・タンパク質目標：${completed.proteinTarget}g/日\n\n食事内容をテキストや写真で送ってください！`
+        text: `登録完了です🎉\n\n【あなたの目標】\n・目標：${completed.goal}\n・体重：${weight}kg\n・カロリー目標：${completed.calorieTarget}kcal/日\n・タンパク質目標：${completed.proteinTarget}g/日\n・脂質目標：${completed.fatTarget}g/日\n・炭水化物目標：${completed.carbsTarget}g/日\n\n食事内容をテキストや写真で送ってください！`
       }]
     });
     return;
   }
 
   const user = profileData;
+  // 目標値のデフォルト設定（古いプロフィールの互換性）
+  const fatTarget = user.fatTarget || 50;
+  const carbsTarget = user.carbsTarget || 180;
   let replyText = '';
 
   if (event.message.type === 'text') {
@@ -258,7 +270,9 @@ async function handleEvent(event) {
         const todayTotal = await callGAS('updateTodayTotal', { userId, date: today, meal });
         const remainCalories = user.calorieTarget - todayTotal.calories;
         const remainProtein = user.proteinTarget - todayTotal.protein;
-        replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
+        const remainFat = fatTarget - todayTotal.fat;
+        const remainCarbs = carbsTarget - todayTotal.carbs;
+        replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}`;
       } else {
         const res = await anthropic.messages.create({
           model: 'claude-sonnet-4-5',
@@ -304,7 +318,9 @@ async function handleEvent(event) {
       const todayTotal = await callGAS('updateTodayTotal', { userId, date: today, meal });
       const remainCalories = user.calorieTarget - todayTotal.calories;
       const remainProtein = user.proteinTarget - todayTotal.protein;
-      replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n\n【アドバイス】\n${meal.advice}`;
+      const remainFat = fatTarget - todayTotal.fat;
+      const remainCarbs = carbsTarget - todayTotal.carbs;
+      replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}`;
     } catch {
       replyText = '画像を解析できませんでした。別の角度から撮り直してみてください。';
     }
@@ -337,4 +353,3 @@ module.exports = async (req, res) => {
 
   res.status(200).json({ ok: true });
 };
-
