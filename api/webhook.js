@@ -33,14 +33,10 @@ function isMealReport(text) {
   return MEAL_PATTERNS.some((re) => re.test(text));
 }
 
-// スプレッドシートの日付形式に合わせる（2026/6/17形式）
 function getToday() {
   const now = new Date();
   const jst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
-  const y = jst.getFullYear();
-  const m = jst.getMonth() + 1;
-  const d = jst.getDate();
-  return `${y}/${m}/${d}`;
+  return `${jst.getFullYear()}/${jst.getMonth() + 1}/${jst.getDate()}`;
 }
 
 function getLastWeekDates() {
@@ -53,12 +49,51 @@ function getLastWeekDates() {
   for (let i = 0; i < 7; i++) {
     const d = new Date(lastMonday);
     d.setDate(lastMonday.getDate() + i);
-    const y = d.getFullYear();
-    const m = d.getMonth() + 1;
-    const day = d.getDate();
-    dates.push(`${y}/${m}/${day}`);
+    dates.push(`${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`);
   }
   return dates;
+}
+
+// アイソカロリー計算式でTDEEと各栄養素目標を計算
+function calculateTargets(weight, height, age, gender, activityLevel, goal) {
+  // 基礎代謝（Mifflin-St Jeor式）
+  let bmr;
+  if (gender === '男性') {
+    bmr = 10 * weight + 6.25 * height - 5 * age + 5;
+  } else {
+    bmr = 10 * weight + 6.25 * height - 5 * age - 161;
+  }
+
+  // 活動係数
+  const activityMap = {
+    '低い（座り仕事中心）': 1.2,
+    '普通（週1〜3回運動）': 1.375,
+    '高い（週4〜5回運動）': 1.55,
+    '非常に高い（毎日運動）': 1.725,
+  };
+  const activityFactor = activityMap[activityLevel] || 1.375;
+  const tdee = Math.round(bmr * activityFactor);
+
+  // 目標別カロリー調整
+  let calorieTarget;
+  if (goal === '減量') calorieTarget = Math.round(tdee - 500);
+  else if (goal === '増量') calorieTarget = Math.round(tdee + 500);
+  else calorieTarget = tdee;
+
+  // PFC計算
+  // タンパク質：体重×2g（減量・ボディメイク）、体重×2.2g（増量）
+  const proteinMultiplier = goal === '増量' ? 2.2 : 2.0;
+  const proteinTarget = Math.round(weight * proteinMultiplier);
+
+  // 脂質：カロリーの25%
+  const fatTarget = Math.round((calorieTarget * 0.25) / 9);
+
+  // 炭水化物：残りカロリーから計算
+  const proteinCalories = proteinTarget * 4;
+  const fatCalories = fatTarget * 9;
+  const carbsTarget = Math.round((calorieTarget - proteinCalories - fatCalories) / 4);
+
+  return { calorieTarget, proteinTarget, fatTarget, carbsTarget };
 }
 
 async function callGAS(action, params = {}) {
@@ -199,6 +234,7 @@ async function handleEvent(event) {
 
   const profileData = await callGAS('getProfile', { userId });
 
+  // 初回ヒアリング：目標選択
   if (!profileData || profileData.step === 'ask_goal') {
     const text = event.message.text || '';
     let goal = null;
@@ -213,14 +249,73 @@ async function handleEvent(event) {
       });
       return;
     }
-    await callGAS('saveProfile', { userId, profile: { step: 'ask_weight', goal } });
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_gender', goal } });
     await lineClient.replyMessage({
       replyToken: event.replyToken,
-      messages: [{ type: 'text', text: `「${goal}」ですね！💪\n\n次に現在の体重を教えてください。\n（例：68）` }]
+      messages: [{ type: 'text', text: `「${goal}」ですね！💪\n\n性別を教えてください。\n\n1️⃣ 男性\n2️⃣ 女性` }]
     });
     return;
   }
 
+  // 初回ヒアリング：性別
+  if (profileData.step === 'ask_gender') {
+    const text = event.message.text || '';
+    let gender = null;
+    if (text.includes('1') || text.includes('男')) gender = '男性';
+    else if (text.includes('2') || text.includes('女')) gender = '女性';
+
+    if (!gender) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '1（男性）か2（女性）でお答えください😊' }]
+      });
+      return;
+    }
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_age', gender } });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: `「${gender}」ですね！\n\n年齢を教えてください。\n（例：25）` }]
+    });
+    return;
+  }
+
+  // 初回ヒアリング：年齢
+  if (profileData.step === 'ask_age') {
+    const age = parseInt(event.message.text);
+    if (isNaN(age) || age < 10 || age > 100) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '年齢を数字で入力してください。\n（例：25）' }]
+      });
+      return;
+    }
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_height', age } });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: `${age}歳ですね！\n\n身長を教えてください。\n（例：170）` }]
+    });
+    return;
+  }
+
+  // 初回ヒアリング：身長
+  if (profileData.step === 'ask_height') {
+    const height = parseFloat(event.message.text);
+    if (isNaN(height) || height < 100 || height > 250) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '身長を数字で入力してください。\n（例：170）' }]
+      });
+      return;
+    }
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_weight', height } });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: `${height}cmですね！\n\n現在の体重を教えてください。\n（例：68）` }]
+    });
+    return;
+  }
+
+  // 初回ヒアリング：体重
   if (profileData.step === 'ask_weight') {
     const weight = parseFloat(event.message.text);
     if (isNaN(weight) || weight < 30 || weight > 200) {
@@ -230,32 +325,60 @@ async function handleEvent(event) {
       });
       return;
     }
-    const calorieMap = { '減量': 1800, '増量': 2800, 'ボディメイク': 2200 };
-    const proteinMap = { '減量': 120, '増量': 160, 'ボディメイク': 140 };
-    const fatMap = { '減量': 50, '増量': 80, 'ボディメイク': 65 };
-    const carbsMap = { '減量': 180, '増量': 320, 'ボディメイク': 250 };
+    await callGAS('saveProfile', { userId, profile: { step: 'ask_activity', weight } });
+    await lineClient.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: `${weight}kgですね！\n\n普段の運動レベルを教えてください。\n\n1️⃣ 低い（座り仕事中心）\n2️⃣ 普通（週1〜3回運動）\n3️⃣ 高い（週4〜5回運動）\n4️⃣ 非常に高い（毎日運動）` }]
+    });
+    return;
+  }
+
+  // 初回ヒアリング：運動レベル
+  if (profileData.step === 'ask_activity') {
+    const text = event.message.text || '';
+    let activityLevel = null;
+    if (text.includes('1') || text.includes('低い')) activityLevel = '低い（座り仕事中心）';
+    else if (text.includes('2') || text.includes('普通')) activityLevel = '普通（週1〜3回運動）';
+    else if (text.includes('3') || text.includes('高い')) activityLevel = '高い（週4〜5回運動）';
+    else if (text.includes('4') || text.includes('非常')) activityLevel = '非常に高い（毎日運動）';
+
+    if (!activityLevel) {
+      await lineClient.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '1〜4の番号でお答えください😊' }]
+      });
+      return;
+    }
+
+    // 全データが揃ったので目標値を計算
+    const targets = calculateTargets(
+      profileData.weight,
+      profileData.height,
+      profileData.age,
+      profileData.gender,
+      activityLevel,
+      profileData.goal
+    );
+
     const completed = {
       step: 'done',
-      goal: profileData.goal,
-      weight,
-      calorieTarget: calorieMap[profileData.goal],
-      proteinTarget: proteinMap[profileData.goal],
-      fatTarget: fatMap[profileData.goal],
-      carbsTarget: carbsMap[profileData.goal],
+      activityLevel,
+      ...targets,
     };
     await callGAS('saveProfile', { userId, profile: completed });
+
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
         type: 'text',
-        text: `登録完了です🎉\n\n【あなたの目標】\n・目標：${completed.goal}\n・体重：${weight}kg\n・カロリー目標：${completed.calorieTarget}kcal/日\n・タンパク質目標：${completed.proteinTarget}g/日\n・脂質目標：${completed.fatTarget}g/日\n・炭水化物目標：${completed.carbsTarget}g/日\n\n食事内容をテキストや写真で送ってください！`
+        text: `登録完了です🎉\n\n【あなたのプロフィール】\n・目標：${profileData.goal}\n・性別：${profileData.gender}\n・年齢：${profileData.age}歳\n・身長：${profileData.height}cm\n・体重：${profileData.weight}kg\n・運動レベル：${activityLevel}\n\n【1日の目標】\n・カロリー：${targets.calorieTarget}kcal\n・タンパク質：${targets.proteinTarget}g\n・脂質：${targets.fatTarget}g\n・炭水化物：${targets.carbsTarget}g\n\n食事内容をテキストや写真で送ってください！`
       }]
     });
     return;
   }
 
+  // 通常の食事解析
   const user = profileData;
-  // 目標値のデフォルト設定（古いプロフィールの互換性）
   const fatTarget = user.fatTarget || 50;
   const carbsTarget = user.carbsTarget || 180;
   let replyText = '';
