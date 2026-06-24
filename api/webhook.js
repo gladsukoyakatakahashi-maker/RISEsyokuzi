@@ -61,7 +61,6 @@ function calculateTargets(weight, height, age, gender, activityLevel, goal) {
   } else {
     bmr = 10 * weight + 6.25 * height - 5 * age - 161;
   }
-
   const activityMap = {
     '低い（座り仕事中心）': 1.2,
     '普通（週1〜3回運動）': 1.375,
@@ -70,19 +69,16 @@ function calculateTargets(weight, height, age, gender, activityLevel, goal) {
   };
   const activityFactor = activityMap[activityLevel] || 1.375;
   const tdee = Math.round(bmr * activityFactor);
-
   let calorieTarget;
   if (goal === '減量') calorieTarget = Math.round(tdee - 500);
   else if (goal === '増量') calorieTarget = Math.round(tdee + 500);
   else calorieTarget = tdee;
-
   const proteinMultiplier = goal === '増量' ? 2.2 : 2.0;
   const proteinTarget = Math.round(weight * proteinMultiplier);
   const fatTarget = Math.round((calorieTarget * 0.25) / 9);
   const proteinCalories = proteinTarget * 4;
   const fatCalories = fatTarget * 9;
   const carbsTarget = Math.round((calorieTarget - proteinCalories - fatCalories) / 4);
-
   return { calorieTarget, proteinTarget, fatTarget, carbsTarget };
 }
 
@@ -120,6 +116,59 @@ async function analyzeMeal(text, goal) {
   }
 }
 
+// 食事内容と目標に合わせた自重トレーニング提案を生成
+async function generateTraining(meal, todayTotal, user) {
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 800,
+    system: `あなたはパーソナルジム「RISEGYM」のトレーニング指導AIです。会員の食事状況と目標に合わせた自宅でできる自重トレーニングを提案してください。`,
+    messages: [{
+      role: 'user',
+      content: `会員情報:
+- 目標: ${user.goal}
+- 今日の摂取カロリー: ${todayTotal.calories}kcal（目標: ${user.calorieTarget}kcal）
+- 今日のタンパク質: ${todayTotal.protein}g（目標: ${user.proteinTarget}g）
+- 直前の食事: ${JSON.stringify(meal)}
+
+上記を踏まえて自宅でできる自重トレーニングを2〜3種目提案してください。
+以下のJSON形式のみで返答してください（マークダウン不要）:
+{
+  "timing": "トレーニングの最適タイミング（例：食後1時間後）",
+  "exercises": [
+    {
+      "name": "種目名",
+      "sets": セット数,
+      "reps": "回数（例：15回）",
+      "form": "正しいフォームの説明（50文字以内）",
+      "muscle": "意識する部位"
+    }
+  ],
+  "duration": "目安時間（例：約15分）",
+  "message": "励ましのひとこと（30文字以内）"
+}`
+    }],
+  });
+  try {
+    const raw = res.content[0].text.replace(/```json|```/g, '').trim();
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function formatTraining(training) {
+  if (!training) return '';
+  let text = `\n\n【今日のおすすめ自重トレーニング】\n⏰ ${training.timing}\n`;
+  training.exercises.forEach((ex, i) => {
+    const emoji = ['💪', '🦵', '🔥'][i] || '⚡';
+    text += `\n${emoji} ${ex.name} ${ex.sets}セット×${ex.reps}\n`;
+    text += `　▶ フォーム：${ex.form}\n`;
+    text += `　▶ 意識部位：${ex.muscle}\n`;
+  });
+  text += `\n⏱ ${training.duration}\n🎯 ${training.message}`;
+  return text;
+}
+
 async function generateWeeklyAdvice(summary, profile) {
   const avgCalories = summary.recordedDays > 0 ? Math.round(summary.totalCalories / summary.recordedDays) : 0;
   const avgProtein = summary.recordedDays > 0 ? Math.round(summary.totalProtein / summary.recordedDays) : 0;
@@ -150,15 +199,12 @@ async function sendWeeklySummaryToAll() {
     try {
       const summary = await callGAS('getWeeklySummary', { userId: user.userId, dates });
       if (summary.recordedDays === 0) continue;
-
       const avgCalories = Math.round(summary.totalCalories / summary.recordedDays);
       const avgProtein = Math.round(summary.totalProtein / summary.recordedDays);
       const calorieDiff = avgCalories - user.calorieTarget;
       const proteinStatus = avgProtein >= user.proteinTarget ? '達成✅' : '未達⚠️';
       const advice = await generateWeeklyAdvice(summary, user);
-
       const message = `先週の食事サマリー（${startDate}〜${endDate}）\n\n【数値結果】\n・平均カロリー：${avgCalories}kcal（目標比：${calorieDiff >= 0 ? '+' : ''}${calorieDiff}kcal）\n・タンパク質：${avgProtein}g → ${proteinStatus}\n・記録日数：${summary.recordedDays}/7日\n\n【今週の重点ポイント】\n${advice.point}\n\n【ひとこと応援】\n${advice.cheer}`;
-
       await fetch('https://api.line.me/v2/bot/message/push', {
         method: 'POST',
         headers: {
@@ -222,18 +268,15 @@ async function handleEvent(event) {
     return;
   }
 
-  // 毎回GASから最新プロフィールを取得
   const profileData = await callGAS('getProfile', { userId });
   const step = profileData ? profileData.step : 'ask_goal';
 
-  // 初回ヒアリング：目標選択
   if (!profileData || step === 'ask_goal') {
     const text = event.message.text || '';
     let goal = null;
     if (text.includes('1') || text.includes('減量')) goal = '減量';
     else if (text.includes('2') || text.includes('増量')) goal = '増量';
     else if (text.includes('3') || text.includes('ボディメイク')) goal = 'ボディメイク';
-
     if (!goal) {
       await lineClient.replyMessage({
         replyToken: event.replyToken,
@@ -249,13 +292,11 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：性別
   if (step === 'ask_gender') {
     const text = event.message.text || '';
     let gender = null;
     if (text.includes('1') || text.includes('男')) gender = '男性';
     else if (text.includes('2') || text.includes('女')) gender = '女性';
-
     if (!gender) {
       await lineClient.replyMessage({
         replyToken: event.replyToken,
@@ -271,7 +312,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：年齢
   if (step === 'ask_age') {
     const age = parseInt(event.message.text);
     if (isNaN(age) || age < 10 || age > 100) {
@@ -289,7 +329,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：身長
   if (step === 'ask_height') {
     const height = parseFloat(event.message.text);
     if (isNaN(height) || height < 100 || height > 250) {
@@ -307,7 +346,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：体重
   if (step === 'ask_weight') {
     const weight = parseFloat(event.message.text);
     if (isNaN(weight) || weight < 30 || weight > 200) {
@@ -325,7 +363,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 初回ヒアリング：運動レベル
   if (step === 'ask_activity') {
     const text = event.message.text || '';
     let activityLevel = null;
@@ -333,7 +370,6 @@ async function handleEvent(event) {
     else if (text.includes('2') || text.includes('普通')) activityLevel = '普通（週1〜3回運動）';
     else if (text.includes('3') || text.includes('高い')) activityLevel = '高い（週4〜5回運動）';
     else if (text.includes('4') || text.includes('非常')) activityLevel = '非常に高い（毎日運動）';
-
     if (!activityLevel) {
       await lineClient.replyMessage({
         replyToken: event.replyToken,
@@ -341,8 +377,6 @@ async function handleEvent(event) {
       });
       return;
     }
-
-    // GASから最新データを取得して計算
     const latestProfile = await callGAS('getProfile', { userId });
     const targets = calculateTargets(
       Number(latestProfile.weight),
@@ -352,7 +386,6 @@ async function handleEvent(event) {
       activityLevel,
       latestProfile.goal
     );
-
     const completed = {
       step: 'done',
       activityLevel,
@@ -362,7 +395,6 @@ async function handleEvent(event) {
       carbsTarget: targets.carbsTarget,
     };
     await callGAS('saveProfile', { userId, profile: completed });
-
     await lineClient.replyMessage({
       replyToken: event.replyToken,
       messages: [{
@@ -373,7 +405,6 @@ async function handleEvent(event) {
     return;
   }
 
-  // 通常の食事解析
   const user = profileData;
   const fatTarget = Number(user.fatTarget) || 50;
   const carbsTarget = Number(user.carbsTarget) || 180;
@@ -391,7 +422,12 @@ async function handleEvent(event) {
         const remainProtein = Number(user.proteinTarget) - todayTotal.protein;
         const remainFat = fatTarget - todayTotal.fat;
         const remainCarbs = carbsTarget - todayTotal.carbs;
-        replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}`;
+
+        // トレーニング提案を並列生成
+        const training = await generateTraining(meal, todayTotal, user);
+        const trainingText = formatTraining(training);
+
+        replyText = `【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}${trainingText}`;
       } else {
         const res = await anthropic.messages.create({
           model: 'claude-sonnet-4-5',
@@ -439,13 +475,22 @@ async function handleEvent(event) {
       const remainProtein = Number(user.proteinTarget) - todayTotal.protein;
       const remainFat = fatTarget - todayTotal.fat;
       const remainCarbs = carbsTarget - todayTotal.carbs;
-      replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}`;
+
+      const training = await generateTraining(meal, todayTotal, user);
+      const trainingText = formatTraining(training);
+
+      replyText = `【料理名】\n${meal.dish}\n\n【解析結果】\n・カロリー：約${meal.calories}kcal\n・P:${meal.protein}g / F:${meal.fat}g / C:${meal.carbs}g\n\n【今日の残り目標】\n・カロリー：あと${Math.max(0, remainCalories)}kcal\n・タンパク質：あと${Math.max(0, remainProtein)}g\n・脂質：あと${Math.max(0, remainFat)}g\n・炭水化物：あと${Math.max(0, remainCarbs)}g\n\n【アドバイス】\n${meal.advice}${trainingText}`;
     } catch {
       replyText = '画像を解析できませんでした。別の角度から撮り直してみてください。';
     }
   }
 
   if (!replyText) return;
+
+  // LINEの文字数制限（5000文字）を超えないよう調整
+  if (replyText.length > 4900) {
+    replyText = replyText.substring(0, 4900) + '...';
+  }
 
   await lineClient.replyMessage({
     replyToken: event.replyToken,
